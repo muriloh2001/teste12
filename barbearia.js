@@ -2,193 +2,141 @@ const venom = require('venom-bot');
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const cors = require('cors');
-const cron = require('node-cron');
-const moment = require('moment'); // Para trabalhar com datas
+const moment = require('moment');
 
 const app = express();
 const PORT = 3000;
 app.use(express.json());
 app.use(cors());
 
-// Banco de dados SQLite
 const db = new sqlite3.Database('./barbearia.db', (err) => {
   if (err) console.error(err.message);
   console.log('Conectado ao banco de dados SQLite.');
 });
 
-// Criar tabela se não existir
 db.run(`CREATE TABLE IF NOT EXISTS agendamentos (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   nome TEXT,
   telefone TEXT,
+  data TEXT,
   horario TEXT,
   servicos TEXT,
-  barbeiro TEXT,
-  status_confirmacao TEXT DEFAULT NULL
+  barbeiro TEXT
 )`);
 
-// Inicia o bot do WhatsApp
+const horariosDisponiveis = [
+  '10:30', '11:00', '11:30',
+  '12:00', '12:30', '13:00', '13:30', '14:00', '14:30', '15:00', '15:30',
+  '16:00', '16:30', '17:00', '17:30', '18:00', '18:30'
+];
+
+function getAvailableTimes(barbeiro, data, callback) {
+  db.all('SELECT horario FROM agendamentos WHERE barbeiro = ? AND data = ?', [barbeiro, data], (err, rows) => {
+    if (err) {
+      console.error('Erro ao verificar horários:', err.message);
+      callback([]);
+      return;
+    }
+    const ocupados = rows.map(row => row.horario);
+    const disponiveis = horariosDisponiveis.filter(h => !ocupados.includes(h));
+    callback(disponiveis);
+  });
+}
+
 venom.create({
-    session: 'barbearia-bot',
-    browserArgs: ['--no-sandbox', '--disable-setuid-sandbox'],
-    headless: 'new' // Adiciona a nova opção de modo headless
-}).then((client) => {  
+  session: 'barbearia-bot',
+  browserArgs: ['--no-sandbox', '--disable-setuid-sandbox'],
+  headless: 'new'
+}).then(client => {
   let userState = {};
 
-  // Função para enviar a confirmação automática
-  function enviarConfirmacao() {
-    db.all('SELECT * FROM agendamentos WHERE status_confirmacao IS NULL', [], (err, rows) => {
-      if (err) {
-        console.error('Erro ao buscar agendamentos:', err.message);
-        return;
-      }
-
-      rows.forEach((agendamento) => {
-        const userId = agendamento.telefone;
-        const nome = agendamento.nome;
-        const horario = agendamento.horario;
-
-        // Envia a mensagem de confirmação
-        client.sendText(userId, `Olá ${nome}, lembrando que seu agendamento está marcado para ${horario}. Por favor, confirme se você ainda irá comparecer. Responda "confirmo" ou "não confirmo".`);
-
-        // Atualiza o status da confirmação para "pendente"
-        db.run('UPDATE agendamentos SET status_confirmacao = "pendente" WHERE id = ?', [agendamento.id], (err) => {
-          if (err) {
-            console.error('Erro ao atualizar o status de confirmação:', err.message);
-          }
-        });
-
-        // Agora, calcular o tempo para enviar a segunda confirmação 1 hora antes do agendamento
-        // Agora, calcular o tempo para enviar a segunda confirmação 3 minutos antes do agendamento
-        const horarioAgendamento = moment(horario, 'HH:mm'); // Agora aceitando o formato 'HH:mm'
-
-        const horaDeConfirmacao = horarioAgendamento.subtract(3, 'minutes'); // Subtrai 3 minutos do agendamento
-
-        // Calcular a diferença de tempo em milissegundos
-        const tempoRestante = horaDeConfirmacao.diff(moment());
-
-        // Verifica se a hora de confirmação está no futuro
-        if (tempoRestante > 0) {
-        // Enviar segunda confirmação 3 minutos antes do agendamento
-        setTimeout(() => {
-            client.sendText(userId, `Olá ${nome}, só para confirmar, seu corte está agendado para às ${horario}. Você ainda vai comparecer? Caso contrário, podemos encaixar outro cliente.`);
-        }, tempoRestante);
-        } else {
-        // Caso o tempo já tenha passado (se o horário de confirmação já passou)
-        client.sendText(userId, `O agendamento já passou. Se precisar remarcar, entre em contato.`);
-        }
-
-      });
-    });
-  }
-
-  // Agendar a confirmação automática 24 horas antes do horário do agendamento
-  cron.schedule('0 9 * * *', () => {  // Exemplo: a cada dia, às 9h (ajustar para sua necessidade)
-    enviarConfirmacao();
-  });
-
-  client.onMessage((message) => {
+  client.onMessage(message => {
     const userId = message.from;
 
     if (message.body.toLowerCase().includes('agendar')) {
-      client.sendText(userId, 'Por favor, informe seu nome e o horário desejado. Exemplo: João, 14h');
-      userState[userId] = { step: 'name_and_time' };
-    } else if (userState[userId] && userState[userId].step === 'name_and_time' && message.body.includes(',')) {
-      const [nome, horario] = message.body.split(',').map((item) => item.trim());
-      userState[userId] = { nome, horario, step: 'choose_service' };
+      client.sendText(userId, 
+        `👋 Olá! Bem-vindo à Barbearia Vicentin!  
+        Eu sou a assistente virtual e estou aqui para te ajudar a marcar seu horário de forma rápida e prática. ✂️💈
+        
+        Aqui você pode agendar seu corte com um dos nossos barbeiros especializados e garantir seu atendimento no melhor horário para você.  
 
-      client.sendText(userId, 'Agora, escolha os serviços desejados (digite os números separados por vírgula):\n1. Corte de cabelo\n2. Corte de barba\n3. Sobrancelha');
-    } else if (userState[userId] && userState[userId].step === 'choose_service') {
-      const servicosEscolhidos = message.body.trim().split(',').map((num) => num.trim());
-
-      const validServices = ['1', '2', '3']; // Serviços válidos
-
-      const isValid = servicosEscolhidos.every((num) => validServices.includes(num));
-
-      if (!isValid) {
-        client.sendText(userId, 'Por favor, escolha os serviços válidos (1, 2, 3) separados por vírgula. Exemplo: 1, 2');
+        Para começar, me diga com qual barbeiro você deseja agendar seu horário:  
+        1️⃣ Emanuele  
+        2️⃣ Felipe  
+        3️⃣ Vicentin `
+      );
+      userState[userId] = { step: 'choose_barber' };
+    } else if (userState[userId]?.step === 'choose_barber') {
+      const barbeiros = { '1': 'Emanuele', '2': 'Felipe', '3': 'Vicentin' };
+      const escolha = message.body.trim();
+      if (!barbeiros[escolha]) {
+        client.sendText(userId, 'Escolha um barbeiro válido (1, 2 ou 3).');
         return;
       }
+      userState[userId].barbeiro = barbeiros[escolha];
+      userState[userId].step = 'choose_date';
+      client.sendText(userId, 'Agora, informe a data desejada (DD/MM/AAAA).');
+    } else if (userState[userId]?.step === 'choose_date') {
+      const data = message.body.trim();
+      if (!moment(data, 'DD/MM/YYYY', true).isValid()) {
+        client.sendText(userId, 'Formato de data inválido. Use DD/MM/AAAA.');
+        return;
+      }
+      userState[userId].data = data;
+      userState[userId].step = 'choose_time';
+      getAvailableTimes(userState[userId].barbeiro, data, availableTimes => {
+        if (availableTimes.length === 0) {
+          client.sendText(userId, 'Não há horários disponíveis para esse dia. Escolha outra data.');
+          userState[userId].step = 'choose_date';
+        } else {
+          client.sendText(userId, `Horários disponíveis: ${availableTimes.join(', ')}`);
+        }
+      });
+    } else if (userState[userId]?.step === 'choose_time') {
+      const horario = message.body.trim();
+      getAvailableTimes(userState[userId].barbeiro, userState[userId].data, availableTimes => {
+        if (!availableTimes.includes(horario)) {
+          client.sendText(userId, 'Horário indisponível. Escolha outro.');
+          return;
+        }
+        userState[userId].horario = horario;
+        userState[userId].step = 'choose_service';
+        client.sendText(userId, 'Escolha os serviços (1, 2 ou 3):\n1. Corte de cabelo\n2. Corte de barba\n3. Sobrancelha');
+      });
+    } else if (userState[userId]?.step === 'choose_service') {
+      const servicosEscolhidos = message.body.trim().split(',').map(num => num.trim());
+      const servicosMap = { '1': 'Corte de cabelo', '2': 'Corte de barba', '3': 'Sobrancelha' };
+      const servicos = servicosEscolhidos.map(num => servicosMap[num]).filter(Boolean).join(', ');
 
-      const servicos = servicosEscolhidos
-        .map((num) => {
-          switch (num) {
-            case '1':
-              return 'Corte de cabelo';
-            case '2':
-              return 'Corte de barba';
-            case '3':
-              return 'Sobrancelha';
-            default:
-              return null;
-          }
-        })
-        .filter(Boolean)
-        .join(', ');
-
+      if (!servicos) {
+        client.sendText(userId, 'Escolha serviços válidos (1, 2 ou 3).');
+        return;
+      }
       userState[userId].servicos = servicos;
-      userState[userId].step = 'choose_barber';
+      userState[userId].step = 'get_name';
+      client.sendText(userId, 'Por favor, informe seu nome completo.');
+    } else if (userState[userId]?.step === 'get_name') {
+      userState[userId].nome = message.body.trim();
+      const { nome, telefone, data, horario, servicos, barbeiro } = {
+        ...userState[userId],
+        telefone: userId
+      };
 
-      client.sendText(userId, 'Agora, escolha o barbeiro (digite o número correspondente):\n1. Emanuele gostosa 1\n2. Meu Amoreco 2\n3. Ela é uma delicinha mesmo 3\n4. Qualquer um');
-    } else if (userState[userId] && userState[userId].step === 'choose_barber') {
-      const barbeirosValidos = ['1', '2', '3', '4'];
-      const barbeiroEscolhido = message.body.trim();
-
-      if (!barbeirosValidos.includes(barbeiroEscolhido)) {
-        client.sendText(userId, 'Escolha um barbeiro válido. Responda com 1, 2, 3 ou 4.');
-        return;
-      }
-
-      let barbeiro = '';
-      switch (barbeiroEscolhido) {
-        case '1':
-          barbeiro = '1 Emanuele gostosa';
-          break;
-        case '2':
-          barbeiro = '2 Meu Amoreco';
-          break;
-        case '3':
-          barbeiro = '3 Ela é uma delicinha mesmo';
-          break;
-        case '4':
-          barbeiro = 'Qualquer um';
-          break;
-      }
-
-      userState[userId].barbeiro = barbeiro;
-      const { nome, horario, servicos } = userState[userId];
-
-      db.run(`INSERT INTO agendamentos (nome, telefone, horario, servicos, barbeiro) VALUES (?, ?, ?, ?, ?)`, [nome, userId, horario, servicos, barbeiro], function(err) {
-        if (err) {
-          console.error('Erro ao salvar agendamento no banco de dados:', err.message);
-          client.sendText(userId, 'Ocorreu um erro ao agendar. Tente novamente.');
-        } else {
-          client.sendText(userId, `Agendamento confirmado para ${nome} às ${horario} com os serviços: ${servicos} e barbeiro: ${barbeiro}.`);
-          userState[userId] = null;
-        }
-      });
-    }
-
-    if (message.body.toLowerCase().includes('confirmo') || message.body.toLowerCase().includes('não confirmo')) {
-      const resposta = message.body.toLowerCase().includes('confirmo') ? 'confirmado' : 'cancelado';
-
-      db.run('UPDATE agendamentos SET status_confirmacao = ? WHERE telefone = ? AND status_confirmacao IS NULL', [resposta, userId], function(err) {
-        if (err) {
-          console.error('Erro ao atualizar a confirmação no banco de dados:', err.message);
-        } else {
-          client.sendText(userId, `Seu agendamento foi ${resposta}.`);
-        }
-      });
-    }
-
-    if (message.body.toLowerCase().includes('obrigado') || message.body.toLowerCase().includes('tchau')) {
-      client.sendText(userId, 'Agradecemos pelo seu contato! Se precisar de mais alguma coisa, estamos à disposição. Até logo!');
-      userState[userId] = null;
+      db.run(`INSERT INTO agendamentos (nome, telefone, data, horario, servicos, barbeiro) VALUES (?, ?, ?, ?, ?, ?)`,
+        [nome, telefone, data, horario, servicos, barbeiro],
+        err => {
+          if (err) {
+            console.error('Erro ao salvar agendamento:', err.message);
+            client.sendText(userId, 'Erro ao agendar. Tente novamente.');
+          } else {
+            client.sendText(userId, `✅ Agendamento confirmado!\n\n📅 Data: ${data}\n⏰ Horário: ${horario}\n💈 Barbeiro: ${barbeiro}\n✂️ Serviços: ${servicos}\n👤 Cliente: ${nome}`);
+            userState[userId] = null;
+          }
+        });
     }
   });
 });
 
-// API para listar agendamentos
 app.get('/agendamentos', (req, res) => {
   db.all('SELECT * FROM agendamentos', [], (err, rows) => {
     if (err) {
